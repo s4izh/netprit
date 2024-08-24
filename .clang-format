@@ -1,0 +1,33 @@
+# Basic .clang-format file with LLVM style
+
+BasedOnStyle: LLVM
+
+# You can override specific settings from the LLVM style below
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 80
+PointerAlignment: Left  # Align pointer with variable name
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: true
+  AfterObjCDeclaration: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+# # Additional options you might want to tweak
+# # AllowShortFunctionsOnASingleLine: Empty
+# SpacesInParentheses: false
+# SpaceBeforeParens: ControlStatements
+# AlignConsecutiveAssignments: true
