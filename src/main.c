@@ -1,11 +1,12 @@
-#include "signal.h"
+#include <arpa/inet.h>
 #include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <pthread.h>
 
 #define CONTROL_PORT 5000
 #define WORKER_PORT 5001
@@ -19,24 +20,29 @@ typedef enum {
     NETPRIT_ERR_BIND,
     NETPRIT_ERR_LISTEN,
     NETPRIT_ERR_ACCEPT,
+    NETPRIT_ERR_PIPE,
     NETPRIT_ERR,
     NETPRIT_ERR_COUNT,
 } netprit_err_t;
 
 const char* const netprit_err_strings[] = {
     "NETPRIT_OK",         "NETPRIT_ERR_SOCKET", "NETPRIT_ERR_BIND",
-    "NETPRIT_ERR_LISTEN", "NETPRIT_ERR_ACCEPT", "NETPRIT_ERR",
+    "NETPRIT_ERR_LISTEN", "NETPRIT_ERR_ACCEPT", "NETPRIT_ERR_PIPE",
+    "NETPRIT_ERR",
 };
 _Static_assert(ARRAY_LEN(netprit_err_strings) == NETPRIT_ERR_COUNT,
                "You must keep your `netprit_err_t` enum and your "
                "`NETPRIT_ERR_COUNT` array in-sync!");
+
+int g_launched_pid = -1;
+pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 const char* netprit_err_str(netprit_err_t err)
 {
     if (err >= 0 && err < NETPRIT_ERR_COUNT)
         return netprit_err_strings[err];
     return NULL;
-};
+}
 
 void netprit_print_err(netprit_err_t err)
 {
@@ -45,7 +51,7 @@ void netprit_print_err(netprit_err_t err)
         fprintf(stderr, "\n");
     else
         fprintf(stderr, ", errno: %s (%d) \n", strerror(errno), errno);
-};
+}
 
 netprit_err_t netprit_server_create_socket(const int port, int* out_sockfd)
 {
@@ -73,43 +79,137 @@ netprit_err_t netprit_server_create_socket(const int port, int* out_sockfd)
     return NETPRIT_OK;
 }
 
-netprit_err_t worker_handler(int client_socket)
+netprit_err_t read_and_launch_process(int client_socket)
 {
-    printf("hello from worker\n");
+    int pipefd[2];
+    int res;
+    char buffer[128];
+    ssize_t nbytes;
+
+    res = pipe(pipefd);
+    if (res < 0) {
+        return NETPRIT_ERR_PIPE;
+    }
+
+    pthread_mutex_lock(&g_mutex);
+    g_launched_pid = fork();
+    pthread_mutex_unlock(&g_mutex);
+
+    switch (g_launched_pid) {
+    case -1: {
+        perror("fork");
+        break;
+    }
+    case 0: {
+        close(pipefd[0]);
+
+        printf("Worker child: changing stdout to socketfd\n");
+
+        // podría enviar directamente al client_socket
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+
+        // close(pipefd[1]);
+        // printf("soy el hijo %d, me quedo en while 1\n", getpid());
+        execlp("ls", "ls", "-l", NULL);
+        // perror("execlp");
+
+        // while (1) {
+        //     sleep(1);
+        //     printf("hola\n");
+        // }
+
+        break;
+    }
+    default: {
+        // close the write end
+        close(pipefd[1]);
+
+        while ((nbytes = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[nbytes] = '\0';
+            printf("Received from child:\n%s", buffer);
+            write(client_socket, buffer, nbytes);
+            // write(1, buffer, sizeof(buffer));
+        }
+
+        // close the read end
+        close(pipefd[0]);
+
+        printf("Worker parent: waiting child to finish\n");
+        waitpid(g_launched_pid, NULL, 0);
+
+        pthread_mutex_lock(&g_mutex);
+        g_launched_pid = -1;
+        pthread_mutex_unlock(&g_mutex);
+
+        printf("child died\n");
+
+        break;
+    }
+    }
 
     return NETPRIT_OK;
 }
 
-void control_loop(int* p_socket)
+void netprit_worker_handler(int server_socket)
 {
     struct sockaddr_in client_addr;
     int addrlen = sizeof(client_addr);
     int client_socket;
-    int server_socket = *p_socket;
+    int res;
+
+    if ((client_socket = accept(server_socket, (struct sockaddr*)&client_addr,
+                                (socklen_t*)&addrlen)) < 0) {
+        perror("Accept failed");
+        return;
+    }
+
+    printf("Worker: connection accepted\n");
+
+    res = read_and_launch_process(client_socket);
+    if (res != NETPRIT_OK) {
+        netprit_print_err(res);
+    }
+
+    close(client_socket);
+}
+
+void netprit_control_loop(int server_socket)
+{
+    struct sockaddr_in client_addr;
+    int addrlen = sizeof(client_addr);
+    int client_socket;
 
     while (1) {
-        if ((client_socket = accept(server_socket, (struct sockaddr*)&client_addr,
-                                    (socklen_t*)&addrlen)) < 0) {
+        printf("Waiting on control loop\n");
+        if ((client_socket =
+                 accept(server_socket, (struct sockaddr*)&client_addr,
+                        (socklen_t*)&addrlen)) < 0) {
             perror("Accept failed");
             close(server_socket);
             return;
         }
-        kill(-1, SIGKILL);
+
+        pthread_mutex_lock(&g_mutex);
+        if (g_launched_pid != -1) {
+            printf("killing pid %d\n", g_launched_pid);
+            kill(g_launched_pid, SIGKILL);
+            g_launched_pid = -1;
+        }
+        pthread_mutex_unlock(&g_mutex);
 
         close(client_socket);
     }
+
     return;
 }
 
-netprit_err_t control_handler(int server_socket)
+netprit_err_t netprit_server_thread(int server_socket, void (*handler)(int),
+                                    pthread_t* tid)
 {
     int res;
-    pthread_t tid;
-
-    int* p_socket = malloc(sizeof(int));
-    *p_socket = server_socket;
-
-    res = pthread_create(&tid, NULL, (void*)control_loop, (void*)p_socket);
+    res = pthread_create(tid, NULL, (void*)handler,
+                         (void*)(intptr_t)server_socket);
     if (res != 0) {
         return NETPRIT_ERR;
     }
@@ -117,34 +217,12 @@ netprit_err_t control_handler(int server_socket)
     return NETPRIT_OK;
 }
 
-int accept_connections(int server_socket, int port,
-                       netprit_err_t (*handler)(int))
-{
-    struct sockaddr_in client_addr;
-    int addrlen = sizeof(client_addr);
-    int client_socket;
-
-    printf("Waiting for connections on port %d...\n", port);
-
-    if ((client_socket = accept(server_socket, (struct sockaddr*)&client_addr,
-                                (socklen_t*)&addrlen)) < 0) {
-        perror("Accept failed");
-        close(server_socket);
-        return NETPRIT_ERR_ACCEPT;
-    }
-
-    int res = handler(client_socket);
-    if (res != NETPRIT_OK) {
-        netprit_print_err(res);
-    }
-    close(client_socket);
-
-    return NETPRIT_OK;
-}
-
 int main(int argc, char* argv[])
 {
     int res;
+
+    pthread_t control_tid;
+    pthread_t worker_tid;
 
     int fd_control_socket;
     int fd_worker_socket;
@@ -162,7 +240,7 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    printf("Server is running...\n");
+    printf("Server running...\n");
 
     while (1) {
         FD_ZERO(&fdset);
@@ -177,21 +255,22 @@ int main(int argc, char* argv[])
             perror("select error");
         }
         if (FD_ISSET(fd_control_socket, &fdset)) {
-            res = control_handler(fd_control_socket);
+            res = netprit_server_thread(
+                fd_control_socket, (void*)netprit_control_loop, &control_tid);
             if (res != NETPRIT_OK) {
                 netprit_print_err(res);
                 return EXIT_FAILURE;
             }
+            FD_CLR(fd_control_socket, &fdset);
         }
         if (FD_ISSET(fd_worker_socket, &fdset)) {
-            res = accept_connections(fd_worker_socket, WORKER_PORT,
-                                     &worker_handler);
+            res = netprit_server_thread(
+                fd_worker_socket, (void*)netprit_worker_handler, &worker_tid);
             if (res != NETPRIT_OK) {
                 netprit_print_err(res);
                 return EXIT_FAILURE;
             }
-            printf("clearing worker_socket from set\n");
-            FD_CLR(fd_control_socket, &fdset);
+            FD_CLR(fd_worker_socket, &fdset);
         }
     }
 
