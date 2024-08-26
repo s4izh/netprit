@@ -8,9 +8,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #define CONTROL_PORT 5000
 #define WORKER_PORT 5001
-#define TARGET_FILE "/tmp/netprit_worker"
+#define NETPRIT_WORKDIR "/tmp/netprit/"
+#define NETPRIT_WORKER_PID_FILE NETPRIT_WORKDIR "worker.pid"
+#define NETPRIT_WORKER_EXE_FILE NETPRIT_WORKDIR "worker.exe"
 
 #define ARRAY_LEN(array) (sizeof(array) / sizeof((array)[0]))
 
@@ -83,17 +89,25 @@ netprit_err_t read_and_launch_process(int client_socket)
 {
     int pipefd[2];
     int res;
-    char buffer[128];
-    ssize_t nbytes;
 
     res = pipe(pipefd);
     if (res < 0) {
         return NETPRIT_ERR_PIPE;
     }
 
+    // TODO check if pid file exists and kill the worker
     pthread_mutex_lock(&g_mutex);
     g_launched_pid = fork();
     pthread_mutex_unlock(&g_mutex);
+
+    // TODO maybe move to main
+    res = mkdir(NETPRIT_WORKDIR, 0755);
+    if (res < 0) {
+        if (errno != EEXIST) {
+            perror("mkdir");
+            return NETPRIT_ERR;
+        }
+    }
 
     switch (g_launched_pid) {
     case -1: {
@@ -101,9 +115,36 @@ netprit_err_t read_and_launch_process(int client_socket)
         break;
     }
     case 0: {
+        char buffer[128];
+        ssize_t nbytes;
+
+        // close read end
         close(pipefd[0]);
 
         printf("Worker child: changing stdout to socketfd\n");
+        printf("Worker child: changing stdout to socketfd\n");
+        fflush(NULL); // si no se flushea tarde y sale por la pipe
+
+        int exe_fd = open(NETPRIT_WORKER_EXE_FILE, O_RDWR | O_CREAT | O_TRUNC, 0700);
+        if (exe_fd < 0) {
+            perror("open");
+            return NETPRIT_ERR;
+        }
+
+        while ((nbytes = read(client_socket, buffer, sizeof(buffer) - 1)) > 0) {
+            write(exe_fd, buffer, nbytes);
+
+            buffer[nbytes] = '\0';
+            printf("Worker child: received from client:\n%s\n", buffer);
+        }
+
+        res = fchmod(exe_fd, S_IRUSR | S_IWUSR | S_IXUSR);
+        if (res < 0) {
+            perror("fchmod");
+            return NETPRIT_ERR;
+        }
+
+        close(exe_fd);
 
         // podría enviar directamente al client_socket
         dup2(pipefd[1], STDOUT_FILENO);
@@ -111,7 +152,7 @@ netprit_err_t read_and_launch_process(int client_socket)
 
         // close(pipefd[1]);
         // printf("soy el hijo %d, me quedo en while 1\n", getpid());
-        execlp("ls", "ls", "-l", NULL);
+        execlp(NETPRIT_WORKER_EXE_FILE, NETPRIT_WORKER_EXE_FILE, NULL);
         // perror("execlp");
 
         // while (1) {
@@ -122,12 +163,25 @@ netprit_err_t read_and_launch_process(int client_socket)
         break;
     }
     default: {
+        char buffer[128];
+        ssize_t nbytes;
+
         // close the write end
         close(pipefd[1]);
 
+        int pid_fd = open(NETPRIT_WORKER_PID_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (pid_fd < 0) {
+            perror("open");
+            return NETPRIT_ERR;
+        }
+        sprintf(buffer, "%d", g_launched_pid);
+        write(pid_fd, buffer, strlen(buffer));
+        close(pid_fd);
+
+        printf("Received from child:\n");
         while ((nbytes = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
             buffer[nbytes] = '\0';
-            printf("Received from child:\n%s", buffer);
+            printf("%s", buffer);
             write(client_socket, buffer, nbytes);
             // write(1, buffer, sizeof(buffer));
         }
@@ -136,13 +190,18 @@ netprit_err_t read_and_launch_process(int client_socket)
         close(pipefd[0]);
 
         printf("Worker parent: waiting child to finish\n");
+
+        // TODO: collect exit code
         waitpid(g_launched_pid, NULL, 0);
 
         pthread_mutex_lock(&g_mutex);
         g_launched_pid = -1;
         pthread_mutex_unlock(&g_mutex);
 
-        printf("child died\n");
+        printf("worker died\n");
+
+        // TODO remove worker pid file
+        // TODO remove worker exe file
 
         break;
     }
